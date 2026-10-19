@@ -370,6 +370,12 @@ def _inline_single_use(func, hidden):
                 if can_inline and target_stmt_idx is not None:
                     nxt = stmts[target_stmt_idx]
                     if _subst_stmt_var(nxt, v_name, s.src):
+                        if getattr(nxt, "inlined_eas", None) is None:
+                            nxt.inlined_eas = []
+                        if getattr(s, "ea", None) is not None:
+                            nxt.inlined_eas.append(s.ea)
+                        if getattr(s, "inlined_eas", None):
+                            nxt.inlined_eas.extend(s.inlined_eas)
                         changed = True
                         i += 1
                         continue

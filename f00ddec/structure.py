@@ -15,25 +15,28 @@ class SLabel:
 class SGoto:
     def __init__(self, ea): self.ea = ea
 class SRet:
-    pass
+    def __init__(self, ea=None): self.ea = ea
 class SIf:
-    def __init__(self, cond, then, els): self.cond = cond; self.then = then; self.els = els
+    def __init__(self, cond, then, els, ea=None):
+        self.cond = cond; self.then = then; self.els = els; self.ea = ea
 class SIfGoto:
-    def __init__(self, cond, ea): self.cond = cond; self.ea = ea
+    def __init__(self, cond, ea, branch_ea=None):
+        self.cond = cond; self.ea = ea; self.branch_ea = branch_ea
 class SWhile:
-    def __init__(self, body, cond=None, dowhile=False):
-        self.body = body; self.cond = cond; self.dowhile = dowhile
+    def __init__(self, body, cond=None, dowhile=False, ea=None):
+        self.body = body; self.cond = cond; self.dowhile = dowhile; self.ea = ea
 class SBreak:
-    pass
+    def __init__(self, ea=None): self.ea = ea
 class SContinue:
-    def __init__(self, cond=None): self.cond = cond
+    def __init__(self, cond=None, ea=None): self.cond = cond; self.ea = ea
 class SBreakIf:
-    def __init__(self, cond): self.cond = cond
+    def __init__(self, cond, ea=None): self.cond = cond; self.ea = ea
 class SSwitch:
-    def __init__(self, expr, cases, default_body=None):
+    def __init__(self, expr, cases, default_body=None, ea=None):
         self.expr = expr
         self.cases = cases              # list of (case_vals_list, body_nodes)
         self.default_body = default_body
+        self.ea = ea
 
 
 _NEG = {"==": "!=", "!=": "==", ">": "<=", "<": ">=", ">=": "<", "<=": ">"}
@@ -130,7 +133,8 @@ class _Structurer:
 
             term = b.term
             if term == "ret":
-                out.append(SRet()); i += 1; continue
+                ret_ea = b.insns[-1].ea if getattr(b, "insns", None) else None
+                out.append(SRet(ea=ret_ea)); i += 1; continue
             if term == "goto":
                 self._emit_edge(out, b.succ[0][1], lo, hi, loop, i + 1, switch_merge)
                 i += 1
@@ -146,21 +150,23 @@ class _Structurer:
                 i += 1
                 continue
             if term == "branch":
-                cond = cond_expr(self._branch_of(b))
+                br = self._branch_of(b)
+                cond = cond_expr(br)
+                br_ea = br.ea if br else (b.insns[-1].ea if getattr(b, "insns", None) else None)
                 taken = b.succ[0][1]
                 fall = b.succ[1][1] if len(b.succ) > 1 else None
                 if switch_merge is not None and taken == switch_merge:
-                    out.append(SBreakIf(cond))
+                    out.append(SBreakIf(cond, ea=br_ea))
                     self._fall_after(out, fall, loop, i, switch_merge)
                     i += 1
                     continue
                 if loop is not None and taken == loop[0]:
-                    out.append(SContinue(cond))
+                    out.append(SContinue(cond, ea=br_ea))
                     self._fall_after(out, fall, loop, i, switch_merge)
                     i += 1
                     continue
                 if loop is not None and taken == loop[1] and switch_merge is None:
-                    out.append(SBreakIf(cond))
+                    out.append(SBreakIf(cond, ea=br_ea))
                     self._fall_after(out, fall, loop, i, switch_merge)
                     i += 1
                     continue
@@ -176,20 +182,20 @@ class _Structurer:
                         else_end_ea = last_then.succ[0][1]
                         ei = self.idx.get(else_end_ea)
                         if (ei is not None and ti < ei <= hi
-                                and (switch_merge is None or else_end_ea != switch_merge)
-                                and self._region_clean(ti, ei, i)):
+                                 and (switch_merge is None or else_end_ea != switch_merge)
+                                 and self._region_clean(ti, ei, i)):
                             then = self._emit(i + 1, ti, loop, switch_merge)
                             if then and isinstance(then[-1], SGoto) and then[-1].ea == else_end_ea:
                                 then = then[:-1]
                             els = self._emit(ti, ei, loop, switch_merge)
-                            out.append(SIf(negate(cond), then, els))
+                            out.append(SIf(negate(cond), then, els, ea=br_ea))
                             i = ei
                             continue
                     then = self._emit(i + 1, ti, loop, switch_merge)
-                    out.append(SIf(negate(cond), then, None))
+                    out.append(SIf(negate(cond), then, None, ea=br_ea))
                     i = ti
                     continue
-                out.append(SIfGoto(cond, taken))
+                out.append(SIfGoto(cond, taken, branch_ea=br_ea))
                 self._fall_after(out, fall, loop, i, switch_merge)
                 i += 1
                 continue
@@ -286,7 +292,7 @@ class _Structurer:
             arm = self._emit_switch_arm(c_lo, c_hi, merge_ea, loop)
             case_arms.append((by_tgt[tgt], arm))
 
-        return SSwitch(sw.expr, case_arms, default_body), merge_idx
+        return SSwitch(sw.expr, case_arms, default_body, ea=sw.ea), merge_idx
 
     def _emit_loop(self, hidx, latch, hi):
         loop_lo, loop_hi = hidx, latch + 1
@@ -306,7 +312,7 @@ class _Structurer:
             f_idx = self.idx[follow_ea]
             if latch < f_idx <= hi:
                 nxt = f_idx
-        return SWhile(body), nxt
+        return SWhile(body, ea=header), nxt
 
     def _fall_after(self, out, fall, loop, i, switch_merge=None):
         if fall is None or self.idx.get(fall) == i + 1:

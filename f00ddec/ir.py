@@ -113,69 +113,76 @@ class IntrExpr(Expr):
 # --- statements -------------------------------------------------------------
 
 class Assign:
-    __slots__ = ("ea", "dst", "src")
+    __slots__ = ("ea", "dst", "src", "inlined_eas")
 
-    def __init__(self, ea, dst, src):
+    def __init__(self, ea, dst, src, inlined_eas=None):
         self.ea = ea
         self.dst = dst
         self.src = src
+        self.inlined_eas = list(inlined_eas) if inlined_eas is not None else []
 
 
 class Call:
-    __slots__ = ("ea", "target", "expr", "args", "is_tail")
+    __slots__ = ("ea", "target", "expr", "args", "is_tail", "inlined_eas")
 
-    def __init__(self, ea, target=None, expr=None, args=None, is_tail=False):
+    def __init__(self, ea, target=None, expr=None, args=None, is_tail=False, inlined_eas=None):
         self.ea = ea
         self.target = target
         self.expr = expr
         self.args = args          # list of argument exprs (filled by callargs pass)
         self.is_tail = is_tail
+        self.inlined_eas = list(inlined_eas) if inlined_eas is not None else []
 
 
 class Intrinsic:
-    __slots__ = ("ea", "name", "args", "note")
+    __slots__ = ("ea", "name", "args", "note", "inlined_eas")
 
-    def __init__(self, ea, name, args, note=""):
+    def __init__(self, ea, name, args, note="", inlined_eas=None):
         self.ea = ea
         self.name = name
         self.args = args
         self.note = note
+        self.inlined_eas = list(inlined_eas) if inlined_eas is not None else []
 
 
 class Ret:
-    __slots__ = ("ea", "kind")
+    __slots__ = ("ea", "kind", "inlined_eas")
 
-    def __init__(self, ea, kind="ret"):
+    def __init__(self, ea, kind="ret", inlined_eas=None):
         self.ea = ea
         self.kind = kind
+        self.inlined_eas = list(inlined_eas) if inlined_eas is not None else []
 
 
 class Goto:
-    __slots__ = ("ea", "target")
+    __slots__ = ("ea", "target", "inlined_eas")
 
-    def __init__(self, ea, target):
+    def __init__(self, ea, target, inlined_eas=None):
         self.ea = ea
         self.target = target
+        self.inlined_eas = list(inlined_eas) if inlined_eas is not None else []
 
 
 class Branch:
-    __slots__ = ("ea", "cexpr", "target", "fallthrough")
+    __slots__ = ("ea", "cexpr", "target", "fallthrough", "inlined_eas")
 
-    def __init__(self, ea, cexpr, target, fallthrough):
+    def __init__(self, ea, cexpr, target, fallthrough, inlined_eas=None):
         self.ea = ea
         self.cexpr = cexpr          # condition expression (taken when true)
         self.target = target
         self.fallthrough = fallthrough
+        self.inlined_eas = list(inlined_eas) if inlined_eas is not None else []
 
 
 class Switch:
-    __slots__ = ("ea", "expr", "cases", "default_ea")
+    __slots__ = ("ea", "expr", "cases", "default_ea", "inlined_eas")
 
-    def __init__(self, ea, expr, cases, default_ea=None):
+    def __init__(self, ea, expr, cases, default_ea=None, inlined_eas=None):
         self.ea = ea
         self.expr = expr            # switch controlling Expr
         self.cases = cases          # list of (case_val, target_ea)
         self.default_ea = default_ea
+        self.inlined_eas = list(inlined_eas) if inlined_eas is not None else []
 
 
 class Nop:

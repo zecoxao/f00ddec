@@ -32,6 +32,40 @@ ACTION_REFRESH = "f00ddec:refresh"
 
 _active_viewer = None
 _ui_hooks = None
+_view_hooks = None
+
+
+def _is_dark_theme():
+    """Detect if IDA is currently using a dark theme."""
+    try:
+        from PySide6 import QtWidgets, QtGui
+        app = QtWidgets.QApplication.instance()
+        if app:
+            pal = app.palette()
+            role = QtGui.QPalette.ColorRole.Base if hasattr(QtGui.QPalette, "ColorRole") else QtGui.QPalette.Base
+            return pal.color(role).lightness() < 128
+    except Exception:
+        pass
+    try:
+        from PyQt5 import QtWidgets, QtGui
+        app = QtWidgets.QApplication.instance()
+        if app:
+            pal = app.palette()
+            role = QtGui.QPalette.ColorRole.Base if hasattr(QtGui.QPalette, "ColorRole") else QtGui.QPalette.Base
+            return pal.color(role).lightness() < 128
+    except Exception:
+        pass
+    return False
+
+
+def _get_highlight_colors():
+    """Return (asm_highlight_color, decomp_highlight_bg) based on active IDA theme."""
+    if _is_dark_theme():
+        # Soft slate blue / dark cyan highlight in dark mode
+        return 0x304855, 0x283848
+    else:
+        # Soft sky blue / cyan highlight in light mode
+        return 0xC0E0FF, 0xD0E8FF
 
 
 def _line_ea(line):
@@ -50,6 +84,20 @@ def _line_ea(line):
         except ValueError:
             pass
     return None
+
+
+def _jumpto_disasm(ea):
+    """Jump to ea in IDA disassembly view (IDA View-A)."""
+    if ea is None:
+        return False
+    try:
+        flags = getattr(ida_kernwin, "UIJMP_IDAVIEW", 0x0001)
+        return ida_kernwin.jumpto(ea, -1, flags)
+    except Exception:
+        try:
+            return idaapi.jumpto(ea)
+        except Exception:
+            return False
 
 
 class _ActionHandler(ida_kernwin.action_handler_t):
@@ -77,15 +125,26 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
         self.current_func_ea = None
         self.current_func_name = None
         self.line_ea = []
+        self.line_to_eas = {}
+        self.ea_to_line = {}
         self.raw_lines = []
+        self.header_count = 0
+        self._selected_line = None
+        self._highlighted_asm_eas = set()
+        self._sync_lock = False
         self.sync_with_disasm = db.get_sync_enabled()
 
     def build_or_refresh(self, fn):
         """Populate or update lines with decompiled Function fn."""
+        self.header_count = getattr(fn, "header_count", 0) or getattr(fn.lines, "header_count", 0)
+        self.clear_asm_highlights()
         self.current_func_ea = fn.entry
         self.current_func_name = fn.name
         self.line_ea = []
+        self.line_to_eas = getattr(fn, "line_to_eas", {}) or {}
+        self.ea_to_line = getattr(fn, "ea_to_line", {}) or {}
         self.raw_lines = list(fn.lines)
+        self._selected_line = None
 
         self.ClearLines()
         fn_line_eas = getattr(fn, "line_eas", None) or getattr(fn.lines, "line_eas", None)
@@ -94,6 +153,195 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             ea = fn_line_eas[i] if (fn_line_eas and i < len(fn_line_eas)) else None
             self.line_ea.append(ea if ea is not None else _line_ea(ln))
         self.Refresh()
+
+        # If IDA's screen cursor is already at a specific executable body statement,
+        # scroll to and highlight that statement.
+        initial_stmt_line = None
+        try:
+            screen_ea = ida_kernwin.get_screen_ea()
+            if screen_ea is not None and screen_ea in self.ea_to_line:
+                cand = self.ea_to_line[screen_ea]
+                if cand >= self.header_count:
+                    initial_stmt_line = cand
+        except Exception:
+            pass
+
+        if initial_stmt_line is not None and initial_stmt_line < len(self.raw_lines):
+            self.select_line(initial_stmt_line, jump=True, update_asm=True, jump_asm=False)
+        else:
+            # When selecting a function, position view at the top without highlighting row 0
+            self._selected_line = None
+            try:
+                self.Jump(0, 0)
+            except Exception:
+                pass
+
+    def clear_asm_highlights(self):
+        """Restore default background color for all previously highlighted asm instructions."""
+        if not self._highlighted_asm_eas:
+            return
+        import ida_nalt
+        for ea in list(self._highlighted_asm_eas):
+            try:
+                ida_nalt.del_item_color(ea)
+            except Exception:
+                pass
+        self._highlighted_asm_eas.clear()
+        try:
+            ida_kernwin.refresh_idaview_anyway()
+        except Exception:
+            pass
+
+    def select_line(self, lineno, jump=False, update_asm=True, jump_asm=True):
+        """Move selection to lineno, visually highlight row, and sync asm highlight."""
+        if lineno < 0 or lineno >= len(self.raw_lines):
+            return
+        prev_line = self._selected_line
+        self._selected_line = lineno
+
+        asm_color, decomp_bg = _get_highlight_colors()
+
+        # Unhighlight previous decompiled line
+        if prev_line is not None and prev_line != lineno and 0 <= prev_line < len(self.raw_lines):
+            try:
+                self.EditLine(prev_line, highlight.colorize(self.raw_lines[prev_line]), bgcolor=0xFFFFFFFF)
+            except Exception:
+                pass
+
+        # Highlight current decompiled line if it has content
+        if self.raw_lines[lineno].strip():
+            try:
+                self.EditLine(lineno, highlight.colorize(self.raw_lines[lineno]), bgcolor=decomp_bg)
+                self.RefreshCurrent()
+            except Exception:
+                pass
+        else:
+            self._selected_line = None
+
+        if jump:
+            try:
+                self.Jump(lineno, 0)
+            except Exception:
+                pass
+
+        if update_asm:
+            self._update_asm_highlight_for_line(lineno, jump_asm=jump_asm)
+
+    def _update_asm_highlight_for_line(self, lineno, jump_asm=True):
+        """Highlight assembly instructions in IDA disassembly corresponding to decompiled line."""
+        import ida_nalt
+
+        # Clear previous asm highlights
+        for ea in list(self._highlighted_asm_eas):
+            try:
+                ida_nalt.del_item_color(ea)
+            except Exception:
+                pass
+        self._highlighted_asm_eas.clear()
+
+        eas = self.line_to_eas.get(lineno, [])
+        if not eas and lineno < len(self.line_ea) and self.line_ea[lineno] is not None:
+            eas = [self.line_ea[lineno]]
+
+        if not eas:
+            if self.line_to_eas:
+                nearest_line = min(self.line_to_eas.keys(), key=lambda l: abs(l - lineno))
+                eas = self.line_to_eas[nearest_line]
+            elif self.current_func_ea is not None:
+                eas = [self.current_func_ea]
+
+        if eas:
+            asm_color, _ = _get_highlight_colors()
+            for ea in eas:
+                try:
+                    ida_nalt.set_item_color(ea, asm_color)
+                    self._highlighted_asm_eas.add(ea)
+                except Exception:
+                    pass
+            try:
+                ida_kernwin.refresh_idaview_anyway()
+            except Exception:
+                pass
+
+            if self.sync_with_disasm and jump_asm:
+                try:
+                    self._sync_lock = True
+                    _jumpto_disasm(eas[0])
+                except Exception:
+                    pass
+                finally:
+                    self._sync_lock = False
+        else:
+            try:
+                ida_kernwin.refresh_idaview_anyway()
+            except Exception:
+                pass
+
+    def sync_from_disasm_ea(self, ea):
+        """Called when cursor moves in disassembly; syncs selection in decompiled view."""
+        if self._sync_lock:
+            return
+        lineno = self.ea_to_line.get(ea)
+        if lineno is None:
+            lineno = self._find_closest_line(ea)
+
+        # If cursor in disassembly is at the function entry or prologue (header lines),
+        # clear body statement highlight and position at top of function without highlighting row 0
+        if lineno is None or lineno < self.header_count:
+            if self._selected_line is not None:
+                if 0 <= self._selected_line < len(self.raw_lines):
+                    try:
+                        self.EditLine(self._selected_line, highlight.colorize(self.raw_lines[self._selected_line]), bgcolor=0xFFFFFFFF)
+                    except Exception:
+                        pass
+                self._selected_line = None
+            self.clear_asm_highlights()
+            return
+
+        if lineno == self._selected_line:
+            return
+
+        self._sync_lock = True
+        try:
+            self.select_line(lineno, jump=True, update_asm=True, jump_asm=False)
+        finally:
+            self._sync_lock = False
+
+    def _find_closest_line(self, ea):
+        """Find the decompiled line whose instruction EA is closest to ea."""
+        if not self.ea_to_line:
+            return None
+        closest_ea = min(self.ea_to_line.keys(), key=lambda e: abs(e - ea))
+        return self.ea_to_line[closest_ea]
+
+    def on_cursor_changed(self):
+        """Called when user clicks or navigates in decompiler window."""
+        if self._sync_lock:
+            return
+        pos = self.GetPos()
+        if not pos:
+            return
+        lineno = pos[0]
+        if lineno < 0 or lineno >= len(self.raw_lines):
+            return
+        if lineno == self._selected_line:
+            return
+
+        self._sync_lock = True
+        try:
+            self.select_line(lineno, jump=False, update_asm=True, jump_asm=True)
+        finally:
+            self._sync_lock = False
+
+    def OnCursorPosChanged(self):
+        self.on_cursor_changed()
+
+    def OnClick(self, shift):
+        self.on_cursor_changed()
+
+    def Close(self):
+        self.clear_asm_highlights()
+        return super().Close()
 
     def show_func(self, ea):
         """Decompile function at ea and refresh view."""
@@ -266,12 +514,12 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
                 if target_ea != ida_idaapi.BADADDR:
                     pfn = ida_funcs.get_func(target_ea)
                     if pfn and pfn.start_ea == target_ea:
-                        idaapi.jumpto(target_ea)
+                        _jumpto_disasm(target_ea)
                         if target_ea != self.current_func_ea:
                             self.show_func(target_ea)
                         return True
                     else:
-                        idaapi.jumpto(target_ea)
+                        _jumpto_disasm(target_ea)
                         return True
             except Exception:
                 pass
@@ -282,7 +530,7 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
                 try:
                     target_ea = int(m.group(1), 16)
                     pfn = ida_funcs.get_func(target_ea)
-                    idaapi.jumpto(target_ea)
+                    _jumpto_disasm(target_ea)
                     if pfn and pfn.start_ea == target_ea and target_ea != self.current_func_ea:
                         self.show_func(target_ea)
                     return True
@@ -294,17 +542,27 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             if m:
                 try:
                     target_ea = int(m.group(1), 16)
-                    idaapi.jumpto(target_ea)
+                    _jumpto_disasm(target_ea)
                     return True
                 except ValueError:
                     pass
 
-        # Fallback: jump to line_ea of current line
-        if lineno is not None and lineno < len(self.line_ea):
-            ea = self.line_ea[lineno]
-            if ea is not None:
-                idaapi.jumpto(ea)
-                return True
+        # Fallback: jump to line_ea or line_to_eas of current line
+        target_ea = None
+        if lineno is not None:
+            if lineno in self.line_to_eas and self.line_to_eas[lineno]:
+                target_ea = self.line_to_eas[lineno][0]
+            elif lineno < len(self.line_ea) and self.line_ea[lineno] is not None:
+                target_ea = self.line_ea[lineno]
+            elif self.line_to_eas:
+                nearest_line = min(self.line_to_eas.keys(), key=lambda l: abs(l - lineno))
+                target_ea = self.line_to_eas[nearest_line][0]
+            elif self.current_func_ea is not None:
+                target_ea = self.current_func_ea
+
+        if target_ea is not None:
+            _jumpto_disasm(target_ea)
+            return True
         return False
 
     def OnDblClick(self, shift):
@@ -328,20 +586,27 @@ class _DecompilerView(ida_kernwin.simplecustviewer_t):
             return True
         if vkey == 27:  # Esc
             global _active_viewer
+            self.clear_asm_highlights()
             _active_viewer = None
             self.Close()
             return True
+        # Navigation keys: Up(38), Down(40), PageUp(33), PageDown(34), Home(36), End(35)
+        if vkey in (38, 40, 33, 34, 36, 35):
+            try:
+                ida_kernwin.execute_ui_requests([self.on_cursor_changed])
+            except Exception:
+                pass
         return False
 
 
-class _ViewHooks(ida_kernwin.UI_Hooks):
+class _UiHooks(ida_kernwin.UI_Hooks):
     def __init__(self, view):
         super().__init__()
         self.view = view
 
     def screen_ea_changed(self, ea, prev_ea):
-        """Automatically follow current function in disassembly when sync is active."""
-        if not self.view or not self.view.sync_with_disasm:
+        """Automatically follow current function in disassembly and sync line selection."""
+        if not self.view or self.view._sync_lock:
             return
         if _active_viewer is not self.view:
             return
@@ -349,12 +614,17 @@ class _ViewHooks(ida_kernwin.UI_Hooks):
         if pfn is None:
             return
         if pfn.start_ea != self.view.current_func_ea:
-            self.view.show_func(pfn.start_ea)
+            if self.view.sync_with_disasm:
+                self.view.show_func(pfn.start_ea)
+            else:
+                return
+        self.view.sync_from_disasm_ea(ea)
 
     def widget_invisible(self, widget):
         """Reset active viewer when the decompiler window is closed."""
         if self.view and widget == self.view.GetWidget():
             global _active_viewer
+            self.view.clear_asm_highlights()
             _active_viewer = None
 
     def finish_populating_widget_popup(self, widget, popup_handle):
@@ -370,6 +640,27 @@ class _ViewHooks(ida_kernwin.UI_Hooks):
         ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_TOGGLE_SYNC)
         ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_JUMP_DISASM)
         ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_REFRESH)
+
+
+class _CustViewHooks(ida_kernwin.View_Hooks):
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+
+    def view_curpos(self, view):
+        """Called whenever cursor position changes in any view."""
+        if self.view and view == self.view.GetWidget():
+            self.view.on_cursor_changed()
+
+    def view_click(self, view, event):
+        """Called on mouse click in view."""
+        if self.view and view == self.view.GetWidget():
+            self.view.on_cursor_changed()
+
+    def view_close(self, view):
+        """Called when view is closed."""
+        if self.view and view == self.view.GetWidget():
+            self.view.clear_asm_highlights()
 
 
 def _register_actions(view):
@@ -395,7 +686,7 @@ def _register_actions(view):
 
 def show(function):
     """Open or refresh the dockable decompiler view for the specified function."""
-    global _active_viewer, _ui_hooks
+    global _active_viewer, _ui_hooks, _view_hooks
     if _active_viewer is None or _active_viewer.GetWidget() is None:
         v = _DecompilerView()
         if not v.Create(_VIEW_TITLE):
@@ -404,10 +695,16 @@ def show(function):
         _register_actions(_active_viewer)
 
         if _ui_hooks is None:
-            _ui_hooks = _ViewHooks(_active_viewer)
+            _ui_hooks = _UiHooks(_active_viewer)
             _ui_hooks.hook()
         else:
             _ui_hooks.view = _active_viewer
+
+        if _view_hooks is None:
+            _view_hooks = _CustViewHooks(_active_viewer)
+            _view_hooks.hook()
+        else:
+            _view_hooks.view = _active_viewer
 
     _active_viewer.build_or_refresh(function)
     _active_viewer.Show()
@@ -427,13 +724,24 @@ def show_listing(title, lines):
 
 def cleanup():
     """Unregister hooks and actions on plugin unload."""
-    global _active_viewer, _ui_hooks
+    global _active_viewer, _ui_hooks, _view_hooks
+    if _active_viewer is not None:
+        try:
+            _active_viewer.clear_asm_highlights()
+        except Exception:
+            pass
     if _ui_hooks is not None:
         try:
             _ui_hooks.unhook()
         except Exception:
             pass
         _ui_hooks = None
+    if _view_hooks is not None:
+        try:
+            _view_hooks.unhook()
+        except Exception:
+            pass
+        _view_hooks = None
     for action_id in [ACTION_RENAME, ACTION_SET_TYPE, ACTION_TOGGLE_SYNC, ACTION_JUMP_DISASM, ACTION_REFRESH]:
         try:
             ida_kernwin.unregister_action(action_id)

@@ -303,6 +303,6 @@ def decompile_one(ea):
     sig = abi.analyze_calling_convention(func, frame_info=frame_info, user_proto=u_proto, ret_types=_RET_CACHE)
     vars.recover_variables(func, sig, frame_info)
     tree = structure.structure(func)
-    lines = cgen.generate(func, tree, namer, frame_info=frame_info, sig=sig, banner=BANNER,
+    lines = cgen.generate(func, tree, namer, frame_info=frame_info, sig=sig, banner=None,
                           user_renames=u_renames, user_types=u_types)
     return Function(entry, namer.code(entry), func, tree, lines)

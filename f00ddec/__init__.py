@@ -27,13 +27,16 @@ BANNER = [
 
 
 class Function:
-    def __init__(self, entry, name, func, tree, lines, line_eas=None):
+    def __init__(self, entry, name, func, tree, lines, line_eas=None, line_to_eas=None, ea_to_line=None, header_count=None):
         self.entry = entry
         self.name = name
         self.cfg = func
         self.tree = tree
         self.lines = lines
         self.line_eas = line_eas if line_eas is not None else getattr(lines, "line_eas", None)
+        self.line_to_eas = line_to_eas if line_to_eas is not None else getattr(lines, "line_to_eas", {})
+        self.ea_to_line = ea_to_line if ea_to_line is not None else getattr(lines, "ea_to_line", {})
+        self.header_count = header_count if header_count is not None else getattr(lines, "header_count", 0)
 
 
 class Program:

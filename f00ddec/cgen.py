@@ -103,43 +103,55 @@ class _Emit:
         pad = "    " * ind
         for n in nodes:
             if isinstance(n, S.SLabel):
-                self._pending.append((ind, None, n.ea, n.ea))
+                self._pending.append((ind, None, n.ea, n.ea, [n.ea]))
             elif isinstance(n, S.SStmt):
                 ea = getattr(n.stmt, "ea", None)
-                self._pending.append((ind, pad + self.stmt(n.stmt), None, ea))
+                inlined = list(getattr(n.stmt, "inlined_eas", []))
+                all_eas = ([ea] if ea is not None else []) + inlined
+                self._pending.append((ind, pad + self.stmt(n.stmt), None, ea, all_eas))
             elif isinstance(n, S.SRet):
                 if self._pending and self._pending[-1][1] and self._pending[-1][1].strip().startswith("return "):
                     continue
-                self._pending.append((ind, pad + ("return r0;" if self.returns_value else "return;"), None, None))
+                ea = getattr(n, "ea", None)
+                self._pending.append((ind, pad + ("return r0;" if self.returns_value else "return;"), None, ea, [ea] if ea else []))
             elif isinstance(n, S.SGoto):
+                ea = getattr(n, "ea", None)
+                all_eas = [ea] if ea is not None else []
                 if n.ea in self.block_starts:
                     self.used_labels.add(n.ea)
-                    self._pending.append((ind, pad + "goto %s;" % self.namer.label(n.ea), None, n.ea))
+                    self._pending.append((ind, pad + "goto %s;" % self.namer.label(n.ea), None, ea, all_eas))
                 else:
-                    self._pending.append((ind, pad + "JUMPOUT(%s);" % self._ext(n.ea), None, n.ea))
+                    self._pending.append((ind, pad + "JUMPOUT(%s);" % self._ext(n.ea), None, ea, all_eas))
             elif isinstance(n, S.SIfGoto):
+                br_ea = getattr(n, "branch_ea", None) or getattr(n, "ea", None)
+                all_eas = [e for e in (br_ea, getattr(n, "ea", None)) if e is not None]
                 if n.ea in self.block_starts:
                     self.used_labels.add(n.ea)
                     tail = "goto %s;" % self.namer.label(n.ea)
                 else:
                     tail = "JUMPOUT(%s);" % self._ext(n.ea)
-                self._pending.append((ind, pad + "if (%s) %s" % (self.expr(n.cond), tail), None, n.ea))
+                self._pending.append((ind, pad + "if (%s) %s" % (self.expr(n.cond), tail), None, br_ea, all_eas))
             elif isinstance(n, S.SBreak):
-                self._pending.append((ind, pad + "break;", None, None))
+                ea = getattr(n, "ea", None)
+                self._pending.append((ind, pad + "break;", None, ea, [ea] if ea is not None else []))
             elif isinstance(n, S.SBreakIf):
-                self._pending.append((ind, pad + "if (%s) break;" % self.expr(n.cond), None, None))
+                ea = getattr(n, "ea", None)
+                self._pending.append((ind, pad + "if (%s) break;" % self.expr(n.cond), None, ea, [ea] if ea is not None else []))
             elif isinstance(n, S.SContinue):
+                ea = getattr(n, "ea", None)
+                all_eas = [ea] if ea is not None else []
                 if n.cond is None:
-                    self._pending.append((ind, pad + "continue;", None, None))
+                    self._pending.append((ind, pad + "continue;", None, ea, all_eas))
                 else:
-                    self._pending.append((ind, pad + "if (%s) continue;" % self.expr(n.cond), None, None))
+                    self._pending.append((ind, pad + "if (%s) continue;" % self.expr(n.cond), None, ea, all_eas))
             elif isinstance(n, S.SIf):
-                self._pending.append((ind, pad + "if (%s) {" % self.expr(n.cond), None, None))
+                ea = getattr(n, "ea", None)
+                self._pending.append((ind, pad + "if (%s) {" % self.expr(n.cond), None, ea, [ea] if ea is not None else []))
                 self.emit(n.then, ind + 1)
                 if n.els:
-                    self._pending.append((ind, pad + "} else {", None, None))
+                    self._pending.append((ind, pad + "} else {", None, None, []))
                     self.emit(n.els, ind + 1)
-                self._pending.append((ind, pad + "}", None, None))
+                self._pending.append((ind, pad + "}", None, None, []))
             elif isinstance(n, S.SWhile):
                 self._emit_while(n, ind)
             elif isinstance(n, S.SSwitch):
@@ -147,28 +159,34 @@ class _Emit:
 
     def _emit_switch(self, n, ind):
         pad = "    " * ind
-        self._pending.append((ind, pad + "switch (%s) {" % self.expr(n.expr), None, None))
+        ea = getattr(n, "ea", None)
+        self._pending.append((ind, pad + "switch (%s) {" % self.expr(n.expr), None, ea, [ea] if ea is not None else []))
         for vals, arm in n.cases:
             for v in vals:
                 v_str = str(v) if v < 10 else "0x%X" % v
-                self._pending.append((ind, pad + "case %s:" % v_str, None, None))
+                self._pending.append((ind, pad + "case %s:" % v_str, None, None, []))
             self.emit(arm, ind + 1)
         if n.default_body:
-            self._pending.append((ind, pad + "default:", None, None))
+            self._pending.append((ind, pad + "default:", None, None, []))
             self.emit(n.default_body, ind + 1)
-        self._pending.append((ind, pad + "}", None, None))
+        self._pending.append((ind, pad + "}", None, None, []))
 
     def _emit_while(self, n, ind):
         pad = "    " * ind
         body = list(n.body)
         tail = None
+        tail_ea = None
+        ea = getattr(n, "ea", None)
+        all_eas = [ea] if ea is not None else []
         if body and isinstance(body[-1], S.SContinue) and body[-1].cond is not None:
             tail = body[-1].cond
+            tail_ea = getattr(body[-1], "ea", None)
             body = body[:-1]
         if tail is not None:
-            self._pending.append((ind, pad + "do {", None, None))
+            self._pending.append((ind, pad + "do {", None, ea, all_eas))
             self.emit(body, ind + 1)
-            self._pending.append((ind, pad + "} while (%s);" % self.expr(tail), None, None))
+            t_eas = [tail_ea] if tail_ea is not None else []
+            self._pending.append((ind, pad + "} while (%s);" % self.expr(tail), None, tail_ea, t_eas))
             return
         # Drop redundant unconditional `continue;` at the end of a while loop
         if body and isinstance(body[-1], S.SContinue) and body[-1].cond is None:
@@ -182,26 +200,32 @@ class _Emit:
         if first_idx is not None and isinstance(body[first_idx], S.SBreakIf):
             wcond = S.negate(body[first_idx].cond)
             body = body[:first_idx] + body[first_idx + 1:]
-            self._pending.append((ind, pad + "while (%s) {" % self.expr(wcond), None, None))
+            self._pending.append((ind, pad + "while (%s) {" % self.expr(wcond), None, ea, all_eas))
             self.emit(body, ind + 1)
-            self._pending.append((ind, pad + "}", None, None))
+            self._pending.append((ind, pad + "}", None, None, []))
         else:
-            self._pending.append((ind, pad + "while (1) {", None, None))
+            self._pending.append((ind, pad + "while (1) {", None, ea, all_eas))
             self.emit(body, ind + 1)
-            self._pending.append((ind, pad + "}", None, None))
+            self._pending.append((ind, pad + "}", None, None, []))
 
     def flush(self):
         out = []
         line_eas = []
-        for ind, text, label_ea, ea in self._pending:
+        line_to_eas = {}
+        for ind, text, label_ea, primary_ea, all_eas in self._pending:
             if label_ea is not None:
                 if label_ea in self.used_labels:
+                    lineno = len(out)
                     out.append("%s:" % self.namer.label(label_ea))
                     line_eas.append(label_ea)
+                    line_to_eas[lineno] = [label_ea]
                 continue
+            lineno = len(out)
             out.append(text)
-            line_eas.append(ea)
-        return out, line_eas
+            line_eas.append(primary_ea)
+            unique_eas = list(dict.fromkeys(e for e in all_eas if e is not None))
+            line_to_eas[lineno] = unique_eas
+        return out, line_eas, line_to_eas
 
 
 def generate(func, tree, namer, frame_info=None, sig=None, banner=None, user_renames=None, user_types=None):
@@ -217,7 +241,7 @@ def generate(func, tree, namer, frame_info=None, sig=None, banner=None, user_ren
     em = _Emit(namer, block_starts=frozenset(func.blocks), returns_value=returns_value,
                hidden=hidden, user_renames=u_renames, user_types=u_types)
     em.emit(tree, 1)
-    body, body_eas = em.flush()
+    body, body_eas, body_line_to_eas = em.flush()
 
     out = CodeLines()
     if banner:
@@ -287,7 +311,51 @@ def generate(func, tree, namer, frame_info=None, sig=None, banner=None, user_ren
             out.append("")
 
     header_count = len(out)
+    out.header_count = header_count
     out.extend(body)
     out.append("}")
     out.line_eas = [None] * header_count + body_eas + [None]
+
+    # Map line numbers to associated instruction EAs
+    out.line_to_eas = {header_count + k: v for k, v in body_line_to_eas.items()}
+    out.ea_to_line = {}
+    for lineno, eas in out.line_to_eas.items():
+        for ea in eas:
+            if ea not in out.ea_to_line:
+                out.ea_to_line[ea] = lineno
+
+    # Map function prototype and header lines to func.entry
+    proto_lineno = len(banner) if banner else 0
+    if proto_lineno < header_count:
+        if func.entry not in out.ea_to_line:
+            out.ea_to_line[func.entry] = proto_lineno
+        for h_line in range(proto_lineno, header_count):
+            if func.entry not in out.line_to_eas.setdefault(h_line, []):
+                out.line_to_eas[h_line].append(func.entry)
+            out.line_eas[h_line] = func.entry
+
+    # Dense instruction completion across all basic blocks in func
+    if getattr(func, "blocks", None):
+        sorted_blocks = sorted(func.blocks.values(), key=lambda b: b.start)
+        for b in sorted_blocks:
+            b_lines = []
+            for s in b.stmts:
+                s_ea = getattr(s, "ea", None)
+                if s_ea in out.ea_to_line:
+                    b_lines.append((s_ea, out.ea_to_line[s_ea]))
+            for ins in getattr(b, "insns", []):
+                if ins.ea in out.ea_to_line:
+                    continue
+                chosen_line = None
+                if b_lines:
+                    _, chosen_line = min(b_lines, key=lambda pair: abs(pair[0] - ins.ea))
+                elif b.start in out.ea_to_line:
+                    chosen_line = out.ea_to_line[b.start]
+                else:
+                    chosen_line = proto_lineno if proto_lineno >= 0 else 0
+                if chosen_line is not None:
+                    out.ea_to_line[ins.ea] = chosen_line
+                    if ins.ea not in out.line_to_eas.setdefault(chosen_line, []):
+                        out.line_to_eas[chosen_line].append(ins.ea)
+
     return out

@@ -117,6 +117,12 @@ def rewrite(func, arity=None):
                             args_list.append(ex)
                             if st is not None and a not in used_since and st in out:
                                 out.remove(st)
+                                if getattr(s, "inlined_eas", None) is None:
+                                    s.inlined_eas = []
+                                if getattr(st, "ea", None) is not None:
+                                    s.inlined_eas.append(st.ea)
+                                if getattr(st, "inlined_eas", None):
+                                    s.inlined_eas.extend(st.inlined_eas)
                     else:
                         args_list.append(ir.Reg(a))
                 s.args = args_list
